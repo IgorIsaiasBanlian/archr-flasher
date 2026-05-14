@@ -338,6 +338,28 @@ rm -f "$PROGRESS_FILE"
 echo "0" > "$PROGRESS_FILE"
 chmod 666 "$PROGRESS_FILE"
 
+# Suspend udisks2 for the entire flash. Without this, the desktop
+# automount kicks in after `dd` finishes (or after `partprobe` later),
+# mounts the freshly-written ext4 partitions, and the kernel updates
+# inode mtime/atime + replays the journal — which invalidates every
+# metadata_csum baked into the image. The R36S initramfs e2fsck then
+# rejects the rootfs as "Filesystem corruption has been detected!"
+# even though the dd write was byte-perfect. We verified this in
+# 20260514: same image, with udisks2 stopped the SD's partition MD5s
+# match the .img bit-for-bit; with udisks2 running they diverge in a
+# 256-byte pattern that exactly tracks ext4 inode boundaries.
+UDISKS2_WAS_ACTIVE=0
+if systemctl is-active --quiet udisks2.service 2>/dev/null; then
+    UDISKS2_WAS_ACTIVE=1
+    systemctl stop udisks2.service 2>/dev/null || true
+fi
+restore_udisks2() {
+    if [ "$UDISKS2_WAS_ACTIVE" -eq 1 ]; then
+        systemctl start udisks2.service 2>/dev/null || true
+    fi
+}
+trap restore_udisks2 EXIT
+
 unmount_all() {
     for part in "${DEVICE}"*; do
         [ -b "$part" ] || continue
