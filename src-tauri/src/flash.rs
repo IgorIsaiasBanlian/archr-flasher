@@ -259,6 +259,21 @@ pub fn flash_image_privileged(
         Command::new("pkexec")
     };
 
+    // Locate the native write helper. Tauri installs both binaries
+    // side-by-side; the debug/release build dirs (target/debug,
+    // target/release) also have them as siblings.
+    let helper_path = std::env::current_exe()
+        .map_err(|e| format!("cannot resolve exe path: {}", e))?
+        .parent()
+        .ok_or_else(|| "no parent dir on exe path".to_string())?
+        .join("archr-flash-write");
+    if !helper_path.is_file() {
+        return Err(format!(
+            "Native write helper not found at {}",
+            helper_path.display()
+        ));
+    }
+
     let child = cmd
         .arg("bash")
         .arg(&script_path)
@@ -267,6 +282,7 @@ pub fn flash_image_privileged(
         .arg(custom_dtbo_path)
         .arg(variant)
         .arg(&progress_file)
+        .arg(helper_path.to_str().unwrap_or(""))
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to run pkexec: {}", e))?;
@@ -414,6 +430,7 @@ DEVICE="$2"
 CUSTOM_DTBO="$3"
 VARIANT="$4"
 PROGRESS_FILE="$5"
+HELPER="$6"
 
 # Up-front diagnostics. When the script aborts later for any reason,
 # this preamble lets the maintainer correlate "what was the input?"
@@ -423,6 +440,7 @@ echo "  IMAGE   = $IMAGE" >&2
 echo "  DEVICE  = $DEVICE" >&2
 echo "  VARIANT = $VARIANT" >&2
 echo "  CUSTOM_DTBO = $CUSTOM_DTBO" >&2
+echo "  HELPER  = $HELPER" >&2
 
 if [ ! -f "$IMAGE" ]; then
     echo "dd failed: source image missing at $IMAGE" >&2
@@ -430,6 +448,10 @@ if [ ! -f "$IMAGE" ]; then
 fi
 if [ ! -b "$DEVICE" ]; then
     echo "dd failed: target $DEVICE is not a block device" >&2
+    exit 1
+fi
+if [ ! -x "$HELPER" ]; then
+    echo "dd failed: native write helper missing or not executable at $HELPER" >&2
     exit 1
 fi
 echo "  IMAGE size = $(stat -c%s "$IMAGE") bytes" >&2
@@ -529,209 +551,51 @@ sleep 2
 # hash mismatch even when the image dd itself completed cleanly).
 blockdev --flushbufs "$DEVICE" 2>/dev/null || true
 
-# === Block size for dd ===
-# We use bs=4M unconditionally. Our manual-dd baseline test (which
-# produces a byte-perfect write on the same SD where the Flasher
-# was failing) uses bs=4M, and on SD controllers with oflag=dsync
-# 4 MB blocks reduce the number of sync round-trips by 4x compared
-# to 1 MB blocks, which empirically eliminates the deterministic
-# corruption we saw with the smaller block size on cheap class-10
-# SDs. The earlier speed-test logic that picked between 4M/1M/512K
-# was net-negative: every byte it wrote to time the SD also had to
-# be overwritten by the image dd, and the in-flight cache state was
-# a source of corruption.
-echo "STAGE:writing" > "$PROGRESS_FILE"
-SPEED_KBS=20000   # informational only, no longer drives BS selection
-SPEED_MBS=$(( SPEED_KBS / 1000 ))
-
-# Fixed bs=4M + oflag=dsync conv=fsync. Matches what the validated
-# manual dd uses; smaller block sizes consistently produced post-dd
-# hash mismatches on the same hardware.
-BS="4M"
-DD_FLAGS="oflag=dsync conv=fsync"
-echo "STAGE:speed_ok:${SPEED_MBS}" > "$PROGRESS_FILE"
-
 # Tiny pause for udev events from the unmounts above to settle. We
-# deliberately do NOT zero the first/last MB any more: the image dd
+# deliberately do NOT zero the first/last MB any more: the image
 # writes through the same byte range, and the pre-passes were
 # implicated in the deterministic-mismatch corruption pattern.
 sleep 1
 blockdev --flushbufs "$DEVICE" 2>/dev/null || true
 
-IMAGE_SIZE=$(stat -c%s "$IMAGE")
-
-# === WRITE ===
-# Bare dd, no background poller, no pipeline. Previous attempts:
-#   (a) `dd ... 2>&1 | awk` for live progress: produced a
-#       deterministic hash mismatch under pkexec. Suspected bash
-#       redirection ordering vs dd's internal dup2 on fd 1.
-#   (b) `tail -F | while read` watcher in a `( ... ) &` wrapper:
-#       caused the main shell to hang on `anon_pipe_read` at exit
-#       because the orphaned tail kept an FD alive.
-#
-# The boring synchronous version is the only one that consistently
-# matches the SHA-256 of a manual `dd`. We trade the live byte
-# counter for absolute correctness. The Rust UI shows the
-# "writing" stage indeterminate while dd runs; users get the
-# final ~95 percent jump when verify starts.
+# Inform the GUI we're entering the write stage. The native helper
+# below publishes live byte counts to PROGRESS_FILE during write and
+# "STAGE:verifying:NN" during verify; the Rust poller in flash.rs
+# already understands both formats. Skipping the legacy STAGE:speed_*
+# events: they were tied to the dd path and the GUI just shows a
+# generic "writing" label now.
+echo "STAGE:speed_ok:0" > "$PROGRESS_FILE"
 echo "STAGE:writing" > "$PROGRESS_FILE"
 
-DD_LOG=$(mktemp)
-DD_RC=0
+# === WRITE + VERIFY (native helper) ===
+# The previous version invoked `dd if=$IMAGE of=$DEVICE oflag=dsync
+# conv=fsync` inline. oflag=dsync forced a per-chunk sync, which we
+# needed back when udisks2 was racing the write; with systemctl-mask
+# udisks2 above, the race is gone and the per-chunk sync is just
+# burning throughput. We now spawn the archr-flash-write helper which
+# does pwrite() in 4 MiB chunks (O_DIRECT when supported), a periodic
+# fsync every 64 MiB to bound the dirty-page backlog, then streams
+# the SD content through SHA-256 for in-process verification. The
+# helper publishes live byte counts to PROGRESS_FILE for the writing
+# bar and "STAGE:verifying:NN" for the verify bar; the existing Rust
+# poller already speaks both.
+"$HELPER" "$IMAGE" "$DEVICE" "$PROGRESS_FILE"
+HELPER_RC=$?
 
-# Launch dd as a background job so we can run an independent progress
-# poller in parallel. Earlier attempts at live progress went through
-# a `dd ... | awk` pipeline and produced deterministic hash mismatches
-# under pkexec; THAT was the redirection-ordering trap, not progress
-# reading per se. Reading /proc/$PID/io while dd runs is purely
-# passive — it never touches dd's fd or its data path, so it cannot
-# corrupt the write.
-dd if="$IMAGE" of="$DEVICE" bs="$BS" $DD_FLAGS 2>"$DD_LOG" &
-DD_PID=$!
-
-# Background poller: read /proc/$PID/io every 2 s, parse the
-# `write_bytes:` line and post that number to PROGRESS_FILE. The Rust
-# polling thread already maps a bare integer in PROGRESS_FILE to a
-# 55..90% writing-stage bar (see flash.rs poll_flash_progress), so we
-# get a real progress meter instead of the 56% freeze. The loop self-
-# terminates as soon as dd is gone (kill -0 on a dead pid fails).
-(
-    while kill -0 "$DD_PID" 2>/dev/null; do
-        if [ -r "/proc/$DD_PID/io" ]; then
-            wb=$(awk '/^write_bytes:/ {print $2; exit}' \
-                "/proc/$DD_PID/io" 2>/dev/null)
-            if [ -n "$wb" ] && [ "$wb" != "0" ]; then
-                echo "$wb" > "$PROGRESS_FILE" 2>/dev/null
-            fi
-        fi
-        sleep 2
-    done
-) &
-POLLER_PID=$!
-
-# Wait for dd to finish. `wait` with a PID returns dd's exit code.
-wait "$DD_PID" || DD_RC=$?
-
-# Tear down the poller cleanly. It may have already exited on its own.
-kill "$POLLER_PID" 2>/dev/null || true
-wait "$POLLER_PID" 2>/dev/null || true
-
-# Echo dd's final stats to stderr for the host log; the last few lines
-# carry the byte-count summary AND any error message ("No space left
-# on device", "Input/output error", "Permission denied", etc.).
-echo "=== dd output (tail) ===" >&2
-tail -8 "$DD_LOG" >&2 2>/dev/null || true
-echo "=== end dd output ===" >&2
-rm -f "$DD_LOG"
-
-if [ "$DD_RC" -ne 0 ]; then
-    # The leading "dd failed:" prefix matters: the Rust side parses
-    # for it explicitly to surface the real cause in the UI instead of
-    # the generic "write-protected" catch-all message.
-    echo "dd failed: rc=$DD_RC after writing to $DEVICE" >&2
+if [ "$HELPER_RC" -ne 0 ]; then
+    # "dd failed:" prefix kept for the Rust matcher in flash.rs.
+    echo "dd failed: archr-flash-write exit $HELPER_RC" >&2
     exit 1
 fi
 
-# Belt-and-suspenders: explicit sync after dd (conv=fsync already did
-# this, but the extra call is cheap and survives any odd kernel
-# behaviour).
+# Belt-and-suspenders: extra global sync after the helper. The helper
+# already fsynced its own fd, but this catches any other dirty pages
+# the kernel was holding for this device under different fds.
 sync
 
-# === POST-WRITE VERIFICATION ===
-# Critical: this MUST abort the whole flash on mismatch.
-#
-# We compute the device SHA-256 on the fly through a pipeline so we
-# never need to materialise a ~5 GB temporary file in /tmp. Previous
-# versions dumped the read-back to `mktemp` and only after `truncate`
-# computed the hash; on hosts where /tmp is a 16 GB tmpfs that was
-# already half full from the decompressed source image, the readback
-# silently truncated and produced a deterministic-looking hash
-# mismatch that had nothing to do with the actual SD content.
-echo "STAGE:verifying:0" > "$PROGRESS_FILE"
-
-# Three-stage cache eviction before we trust a read-back from the SD:
-#   1. `sync` flushes dirty pages to the device queue.
-#   2. `blockdev --flushbufs` issues ioctl(BLKFLSBUF) which evicts the
-#      block device cache for this specific device.
-#   3. `echo 3 > drop_caches` clears the system-wide pagecache.
-#   4. A 3 s sleep lets cheap SD controllers actually persist writes
-#      from their internal RAM to NAND.
-sync
-blockdev --flushbufs "$DEVICE" 2>/dev/null || true
-echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-sleep 5
-
-IMAGE_HASH=$(sha256sum "$IMAGE" | cut -d' ' -f1)
-
-# Stream the SD content straight through sha256sum, capped at
-# IMAGE_SIZE via head -c. No temp file, no truncate; the entire
-# verification runs in a few MB of memory regardless of image size.
-# `iflag=nocache` keeps the page cache out of the read path.
-BLOCK_COUNT=$(( (IMAGE_SIZE + 4194303) / 4194304 ))
-
-compute_device_hash() {
-    # Intentionally NO pipefail here. `head -c $IMAGE_SIZE` closes its
-    # stdin once it has the bytes it wants, which sends SIGPIPE to dd
-    # (because we asked dd to read one block-size extra to cover the
-    # trailing partial block). dd then exits 141. Under pipefail this
-    # poisons the whole pipeline even though sha256sum saw the right
-    # bytes and produced the right hash.
-    #
-    # We trust sha256sum: it only emits its 64-char hex line if it
-    # finished reading and hashing successfully. If the pipeline
-    # aborts earlier we get no output, and the caller treats an empty
-    # hash as a verification failure.
-    local h
-    h=$(dd if="$DEVICE" iflag=nocache bs=4M count=$BLOCK_COUNT status=none 2>/dev/null \
-        | head -c "$IMAGE_SIZE" \
-        | sha256sum 2>/dev/null \
-        | cut -d' ' -f1) || h=""
-    if [ -z "$h" ] || [ "${#h}" -ne 64 ]; then
-        return 1
-    fi
-    echo "$h"
-}
-
-# No background progress poller during verify. We previously had a
-# `( while :; do echo STAGE:verifying:N; sleep 8; done ) &` running
-# in parallel with compute_device_hash, but that subshell competed
-# for shell scheduling and was suspected of altering the timing
-# around the dd | head | sha256sum pipeline enough to cause
-# non-deterministic hash mismatches under pkexec. The UI just shows
-# verifying:50 throughout and jumps to 100 when the hash is known.
-echo "STAGE:verifying:50" > "$PROGRESS_FILE"
-DEVICE_HASH=$(compute_device_hash)
-COMPUTE_RC=$?
-echo "STAGE:verifying:100" > "$PROGRESS_FILE"
-
-if [ "$COMPUTE_RC" -ne 0 ] || [ -z "$DEVICE_HASH" ]; then
-    echo "Verification failed: could not read $DEVICE for hashing" >&2
-    echo "VERIFY_FAILED:read_error" > "$PROGRESS_FILE"
-    exit 1
-fi
-
-if [ "$IMAGE_HASH" != "$DEVICE_HASH" ]; then
-    echo "Verification mismatch on first attempt; retrying after extended settle..." >&2
-    sync
-    sleep 10
-    blockdev --flushbufs "$DEVICE" 2>/dev/null || true
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-    sleep 5
-    DEVICE_HASH2=$(compute_device_hash)
-    if [ "$IMAGE_HASH" = "$DEVICE_HASH2" ]; then
-        echo "Verification passed on retry: SHA256 matches ($IMAGE_HASH)" >&2
-        DEVICE_HASH="$DEVICE_HASH2"
-    fi
-fi
-
-if [ "$IMAGE_HASH" != "$DEVICE_HASH" ]; then
-    echo "Verification failed: SD content differs from image." >&2
-    echo "  expected (image):  $IMAGE_HASH" >&2
-    echo "  got      (device): $DEVICE_HASH" >&2
-    echo "VERIFY_FAILED:${IMAGE_HASH}:${DEVICE_HASH}" > "$PROGRESS_FILE"
-    exit 1
-fi
-echo "Verification passed: SHA256 matches ($IMAGE_HASH)" >&2
+# archr-flash-write already streamed the device through SHA-256 and
+# aborted with non-zero exit if the hash differed from the image. No
+# second verify here.
 
 # Re-read partition table with retry (kernel may be slow to update)
 for i in 1 2 3; do
