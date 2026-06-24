@@ -1,4 +1,4 @@
-/* Arch R Flasher — Dark wizard theme */
+/* Arch R Flasher : Dark wizard theme */
 
 @font-face {
   font-family: 'Quantico';
@@ -632,6 +632,119 @@ body {
 
 .custom-dtb-section {
   margin-top: 4px;
+}
+
+/* ── Overlay step (Flash + Overlay modes) ── */
+/* Step 3 in the Flash wizard and step 2 in the Overlay wizard share
+   this block: pick a generated mipi-panel.dtbo from the web generator
+   or skip and keep the image's default. The HTML/JS for both modes
+   uses the same classes. */
+.overlay-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.overlay-intro {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.overlay-intro code {
+  font-family: ui-monospace, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  background: var(--bg-card);
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--text);
+}
+
+.btn-primary {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: white;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--blue-light);
+  border-color: var(--blue-light);
+}
+
+.overlay-file-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.overlay-file-row .btn {
+  width: auto;
+  flex: 0 0 auto;
+}
+
+.overlay-picked {
+  font-family: ui-monospace, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  word-break: break-all;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.overlay-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin: 4px 0 0;
+}
+
+.overlay-skip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+
+.overlay-skip input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg-card);
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.overlay-skip input[type="checkbox"]:hover {
+  border-color: var(--blue);
+}
+
+.overlay-skip input[type="checkbox"]:checked {
+  background: var(--blue);
+  border-color: var(--blue);
+}
+
+.overlay-skip input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0px;
+  width: 5px;
+  height: 10px;
+  border: solid white;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
 }
 
 /* ── Nav bar ── */
